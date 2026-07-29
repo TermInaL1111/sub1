@@ -2,7 +2,7 @@ import math
 import threading
 import time
 
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PointStamped, PoseStamped
 from luxinav_interfaces.msg import Decision, EpisodeState, RunContext
 from luxinav_interfaces.srv import EvaluateEpisode, Readiness
 from luxinav_sim.backend_protocol import (
@@ -209,6 +209,7 @@ class EnvHarness:
             "pose": [],
             "odometry": [],
             "goal": [],
+            "goal_vector": [],
             "state": [],
         }
         reliable = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.RELIABLE)
@@ -247,6 +248,12 @@ class EnvHarness:
                 String,
                 "/luxinav/goal/text",
                 lambda msg: self.messages["goal"].append(msg),
+                reliable,
+            ),
+            self.probe.create_subscription(
+                PointStamped,
+                "/luxinav/goal/vector",
+                lambda msg: self.messages["goal_vector"].append(msg),
                 reliable,
             ),
             self.probe.create_subscription(
@@ -366,6 +373,9 @@ def test_env_node_exposes_canonical_graph_types_and_qos(env_harness):
     assert topics["/luxinav/observation/pose"] == ["geometry_msgs/msg/PoseStamped"]
     assert topics["/luxinav/observation/odometry"] == ["nav_msgs/msg/Odometry"]
     assert topics["/luxinav/goal/text"] == ["std_msgs/msg/String"]
+    assert topics["/luxinav/goal/vector"] == [
+        "geometry_msgs/msg/PointStamped"
+    ]
     assert topics["/luxinav/episode/state"] == [
         "luxinav_interfaces/msg/EpisodeState"
     ]
@@ -391,8 +401,14 @@ def test_env_node_exposes_canonical_graph_types_and_qos(env_harness):
     rgb_qos = env_harness.env.get_publishers_info_by_topic(
         "/luxinav/observation/rgb"
     )[0].qos_profile
+    depth_qos = env_harness.env.get_publishers_info_by_topic(
+        "/luxinav/observation/depth"
+    )[0].qos_profile
     odom_qos = env_harness.env.get_publishers_info_by_topic(
         "/luxinav/observation/odometry"
+    )[0].qos_profile
+    goal_vector_qos = env_harness.env.get_publishers_info_by_topic(
+        "/luxinav/goal/vector"
     )[0].qos_profile
     assert (context_qos.reliability, context_qos.depth) == (
         QoSReliabilityPolicy.RELIABLE,
@@ -407,7 +423,15 @@ def test_env_node_exposes_canonical_graph_types_and_qos(env_harness):
         10,
     )
     assert rgb_qos.reliability == QoSReliabilityPolicy.BEST_EFFORT
+    assert (depth_qos.reliability, depth_qos.depth) == (
+        qos_profile_sensor_data.reliability,
+        qos_profile_sensor_data.depth,
+    )
     assert odom_qos.reliability == QoSReliabilityPolicy.BEST_EFFORT
+    assert (goal_vector_qos.reliability, goal_vector_qos.depth) == (
+        QoSReliabilityPolicy.RELIABLE,
+        10,
+    )
 
 
 def test_frame_identity_rejects_stale_foreign_and_duplicate_decisions(env_harness):
@@ -458,7 +482,15 @@ def test_each_frame_has_one_full_context_and_timestamp_join(env_harness):
     env_harness.wait_for(
         lambda: all(
             len(env_harness.messages[name]) == 2
-            for name in ("context", "rgb", "depth", "pose", "odometry", "goal")
+            for name in (
+                "context",
+                "rgb",
+                "depth",
+                "pose",
+                "odometry",
+                "goal",
+                "goal_vector",
+            )
         )
     )
 
@@ -478,7 +510,7 @@ def test_each_frame_has_one_full_context_and_timestamp_join(env_harness):
     ]
     for index, context in enumerate(contexts):
         expected_stamp = _stamp_tuple(context.stamp)
-        for name in ("rgb", "depth", "pose", "odometry"):
+        for name in ("rgb", "depth", "pose", "odometry", "goal_vector"):
             assert _stamp_tuple(
                 env_harness.messages[name][index].header.stamp
             ) == expected_stamp
@@ -508,6 +540,18 @@ def test_each_frame_has_one_full_context_and_timestamp_join(env_harness):
     assert [message.data for message in env_harness.messages["goal"]] == [
         "mock target",
         "mock target",
+    ]
+    assert [
+        (
+            message.header.frame_id,
+            message.point.x,
+            message.point.y,
+            message.point.z,
+        )
+        for message in env_harness.messages["goal_vector"]
+    ] == [
+        ("map", 0.5, 0.0, 0.0),
+        ("map", 0.5, 0.0, 0.0),
     ]
     assert env_harness.messages["rgb"][0].step == 6
     assert env_harness.messages["rgb"][0].encoding == "rgb8"

@@ -1,6 +1,7 @@
 import threading
 import time
 
+from geometry_msgs.msg import PointStamped
 from luxinav_interfaces.msg import Decision, EpisodeState, RunContext
 from luxinav_interfaces.srv import EvaluateEpisode
 from luxinav_sim.env_node import EnvNode
@@ -59,6 +60,7 @@ def test_real_mock_http_backend_drives_one_ros_frame_transition():
     probe = Node("env_mock_integration_probe", context=context)
     reliable = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.RELIABLE)
     contexts = []
+    goal_vectors = []
     states = []
     context_sub = probe.create_subscription(
         RunContext,
@@ -70,6 +72,12 @@ def test_real_mock_http_backend_drives_one_ros_frame_transition():
         EpisodeState,
         "/luxinav/episode/state",
         states.append,
+        reliable,
+    )
+    goal_vector_sub = probe.create_subscription(
+        PointStamped,
+        "/luxinav/goal/vector",
+        goal_vectors.append,
         reliable,
     )
     decision_pub = probe.create_publisher(
@@ -117,6 +125,7 @@ def test_real_mock_http_backend_drives_one_ros_frame_transition():
         wait_for(evaluation.done)
         response = evaluation.result()
         wait_for(lambda: [item.frame_id for item in contexts] == [0, 1])
+        wait_for(lambda: len(goal_vectors) == 2)
         wait_for(
             lambda: any(
                 state.state == EpisodeState.EPISODE_FINISHED for state in states
@@ -144,6 +153,27 @@ def test_real_mock_http_backend_drives_one_ros_frame_transition():
         assert response.success is False
         assert response.error == ""
         assert [
+            (
+                goal.header.frame_id,
+                goal.point.x,
+                goal.point.y,
+                goal.point.z,
+                goal.header.stamp.sec,
+                goal.header.stamp.nanosec,
+            )
+            for goal in goal_vectors
+        ] == [
+            (
+                "map",
+                0.5,
+                0.0,
+                0.0,
+                context.stamp.sec,
+                context.stamp.nanosec,
+            )
+            for context in contexts
+        ]
+        assert [
             (state.state, state.context.frame_id) for state in states
         ] == [
             (EpisodeState.READY, 0),
@@ -162,6 +192,7 @@ def test_real_mock_http_backend_drives_one_ros_frame_transition():
         executor_thread.join(timeout=2.0)
         probe.destroy_subscription(context_sub)
         probe.destroy_subscription(state_sub)
+        probe.destroy_subscription(goal_vector_sub)
         probe.destroy_node()
         env.destroy_node()
         rclpy.shutdown(context=context)

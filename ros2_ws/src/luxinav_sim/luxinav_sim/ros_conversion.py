@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 
 from builtin_interfaces.msg import Time
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PointStamped, PoseStamped
 from luxinav_interfaces.msg import Decision, RunContext
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image
@@ -73,6 +73,17 @@ def odometry_message(observation: Observation, stamp: Time) -> Odometry:
 
 def goal_text_message(observation: Observation) -> String:
     return String(data=str(observation.goal["text"]))
+
+
+def goal_vector_message(
+    observation: Observation, stamp: Time
+) -> PointStamped:
+    message = PointStamped()
+    message.header.stamp = stamp
+    message.header.frame_id = "map"
+    message.point.x = observation.goal["x"]
+    message.point.y = observation.goal["y"]
+    return message
 
 
 def decision_payload(message: Decision) -> DecisionPayload:

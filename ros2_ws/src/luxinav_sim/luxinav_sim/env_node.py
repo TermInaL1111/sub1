@@ -8,7 +8,7 @@ import time
 from typing import Any, Callable, Mapping, TypeVar
 
 from builtin_interfaces.msg import Time
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PointStamped, PoseStamped
 from luxinav_interfaces.msg import Decision, EpisodeState, RunContext
 from luxinav_interfaces.srv import EvaluateEpisode, Readiness
 from nav_msgs.msg import Odometry
@@ -29,6 +29,7 @@ from .http_backend import HttpEnvironmentBackend
 from .ros_conversion import (
     decision_payload,
     goal_text_message,
+    goal_vector_message,
     image_message,
     odometry_message,
     pose_message,
@@ -118,6 +119,9 @@ class EnvNode(Node):
         )
         self._goal_pub = self.create_publisher(
             String, "/luxinav/goal/text", reliable
+        )
+        self._goal_vector_pub = self.create_publisher(
+            PointStamped, "/luxinav/goal/vector", reliable
         )
         self._state_pub = self.create_publisher(
             EpisodeState, "/luxinav/episode/state", reliable
@@ -233,6 +237,9 @@ class EnvNode(Node):
         self._pose_pub.publish(pose_message(observation, stamp))
         self._odometry_pub.publish(odometry_message(observation, stamp))
         self._goal_pub.publish(goal_text_message(observation))
+        self._goal_vector_pub.publish(
+            goal_vector_message(observation, stamp)
+        )
 
     def _publish_state_locked(
         self, context: RunContext, state: int, steps: int, detail: str = ""
