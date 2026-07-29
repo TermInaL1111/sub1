@@ -18,4 +18,9 @@ setup(
     maintainer_email="maintainer@example.com",
     description="Simulator-neutral environment backend protocol for LuxiNav.",
     license="Apache-2.0",
+    entry_points={
+        "console_scripts": [
+            "env_node = luxinav_sim.env_node:main",
+        ],
+    },
 )
