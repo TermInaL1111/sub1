@@ -1,0 +1,6 @@
+[
+  {"frame_id": 0, "pose": {"x": 0.0, "y": 0.0, "yaw": 0.0}, "state": "READY"},
+  {"frame_id": 1, "pose": {"x": 0.5, "y": 0.0, "yaw": 0.0}, "state": "READY", "metrics": {"steps": 1, "success": false}},
+  {"frame_id": 2, "pose": {"x": 0.5, "y": 0.0, "yaw": 0.174532925}, "state": "READY", "metrics": {"steps": 2, "success": false}},
+  {"frame_id": 3, "pose": {"x": 0.5, "y": 0.0, "yaw": 0.174532925}, "state": "EPISODE_FINISHED", "metrics": {"steps": 3, "success": true}}
+]
