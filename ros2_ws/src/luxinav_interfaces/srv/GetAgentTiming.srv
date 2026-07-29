@@ -1,0 +1,8 @@
+string run_id
+string episode_id
+---
+bool ok
+uint32 decision_count
+float64 total_seconds
+float64 mean_seconds
+string error

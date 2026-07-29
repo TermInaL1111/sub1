@@ -1,0 +1,9 @@
+uint8 READY=0
+uint8 RUNNING=1
+uint8 ACTION_FINISHED=2
+uint8 EPISODE_FINISHED=3
+uint8 FAILED=4
+RunContext context
+uint8 state
+uint32 step_count
+string detail

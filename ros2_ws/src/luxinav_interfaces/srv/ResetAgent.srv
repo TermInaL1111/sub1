@@ -1,0 +1,6 @@
+string run_id
+string episode_id
+uint64 seed
+---
+bool done
+string error

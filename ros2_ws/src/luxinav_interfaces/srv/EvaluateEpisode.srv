@@ -1,0 +1,13 @@
+string run_id
+string episode_selector
+uint32 max_steps
+---
+bool accepted
+string episode_id
+string scene_id
+bool success
+float64 spl
+float64 distance_to_goal
+uint32 steps
+float64 simulator_seconds
+string error

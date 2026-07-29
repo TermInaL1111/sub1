@@ -1,0 +1,6 @@
+string run_id
+---
+bool ready
+string component_id
+string status
+string error

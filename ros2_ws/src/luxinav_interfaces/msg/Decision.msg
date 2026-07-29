@@ -1,0 +1,15 @@
+uint8 CONTINUOUS_CONTROL=1
+uint8 DISCRETE_ACTION=2
+uint8 NAVIGATION_GOAL=3
+uint8 STOP=4
+RunContext context
+uint8 kind
+geometry_msgs/Twist continuous_control
+float32 camera_pitch
+int32 discrete_action
+string action_space
+geometry_msgs/PoseStamped navigation_goal
+float32 goal_tolerance
+string marked_grid_uri
+string stop_reason
+bool success_claim
