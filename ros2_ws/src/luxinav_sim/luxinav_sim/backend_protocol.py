@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+import math
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Iterator, Mapping, Protocol, runtime_checkable
 
 
 class ProtocolValidationError(ValueError):
@@ -191,42 +192,144 @@ class Observation:
         }
 
 
+@dataclass(frozen=True, eq=False)
+class EpisodeMetrics(Mapping[str, Any]):
+    """Complete immutable metrics returned by an environment episode."""
+
+    scene_id: str
+    success: bool
+    spl: float
+    distance_to_goal: float
+    steps: int
+    simulator_seconds: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "scene_id", _string(self.scene_id, "metrics.scene_id"))
+        if not isinstance(self.success, bool):
+            raise ProtocolValidationError("metrics.success must be a boolean")
+        spl = _finite_number(self.spl, "metrics.spl")
+        if not 0.0 <= spl <= 1.0:
+            raise ProtocolValidationError("metrics.spl must be between 0 and 1")
+        object.__setattr__(self, "spl", spl)
+        distance = _finite_number(
+            self.distance_to_goal, "metrics.distance_to_goal"
+        )
+        if distance < 0.0:
+            raise ProtocolValidationError(
+                "metrics.distance_to_goal must be non-negative"
+            )
+        object.__setattr__(self, "distance_to_goal", distance)
+        object.__setattr__(self, "steps", _integer(self.steps, "metrics.steps"))
+        simulator_seconds = _finite_number(
+            self.simulator_seconds, "metrics.simulator_seconds"
+        )
+        if simulator_seconds < 0.0:
+            raise ProtocolValidationError(
+                "metrics.simulator_seconds must be non-negative"
+            )
+        object.__setattr__(self, "simulator_seconds", simulator_seconds)
+
+    @classmethod
+    def from_wire(cls, value: Any) -> "EpisodeMetrics":
+        wire = _mapping(value, "metrics")
+        _required(
+            wire,
+            {
+                "scene_id",
+                "success",
+                "spl",
+                "distance_to_goal",
+                "steps",
+                "simulator_seconds",
+            },
+            "metrics",
+        )
+        return cls(
+            scene_id=wire["scene_id"],
+            success=wire["success"],
+            spl=wire["spl"],
+            distance_to_goal=wire["distance_to_goal"],
+            steps=wire["steps"],
+            simulator_seconds=wire["simulator_seconds"],
+        )
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "scene_id": self.scene_id,
+            "success": self.success,
+            "spl": self.spl,
+            "distance_to_goal": self.distance_to_goal,
+            "steps": self.steps,
+            "simulator_seconds": self.simulator_seconds,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_wire()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(
+            (
+                "scene_id",
+                "success",
+                "spl",
+                "distance_to_goal",
+                "steps",
+                "simulator_seconds",
+            )
+        )
+
+    def __len__(self) -> int:
+        return 6
+
+
 @dataclass(frozen=True)
 class StepResult:
     observation: Observation
-    metrics: Mapping[str, Any]
+    metrics: EpisodeMetrics
 
     @classmethod
     def from_wire(cls, value: Any) -> "StepResult":
         wire = _mapping(value, "step result")
         _required(wire, {"metrics"}, "step result")
-        metrics = _mapping(wire["metrics"], "step result.metrics")
-        _required(metrics, {"steps", "success"}, "step result.metrics")
-        steps = _integer(metrics["steps"], "step result.metrics.steps")
-        if not isinstance(metrics["success"], bool):
-            raise ProtocolValidationError("step result.metrics.success must be a boolean")
         observation_wire = {key: value for key, value in wire.items() if key != "metrics"}
         return cls(
             observation=Observation.from_wire(observation_wire),
-            metrics=MappingProxyType({"steps": steps, "success": metrics["success"]}),
+            metrics=EpisodeMetrics.from_wire(wire["metrics"]),
         )
 
     def to_wire(self) -> dict[str, Any]:
-        return {**self.observation.to_wire(), "metrics": dict(self.metrics)}
+        return {**self.observation.to_wire(), "metrics": self.metrics.to_wire()}
 
 
 @runtime_checkable
 class EnvironmentBackend(Protocol):
     """Structural boundary implemented by simulator environment backends."""
 
-    def health(self) -> Mapping[str, Any]: ...
+    def health(self, *, timeout_seconds: float | None = None) -> Mapping[str, Any]: ...
 
     def reset(
-        self, run_id: str, episode_id: str, seed: int, max_steps: int
+        self,
+        run_id: str,
+        episode_id: str,
+        seed: int,
+        max_steps: int,
+        *,
+        timeout_seconds: float | None = None,
     ) -> Observation: ...
 
-    def step(self, decision: DecisionPayload) -> StepResult: ...
+    def step(
+        self, decision: DecisionPayload, *, timeout_seconds: float | None = None
+    ) -> StepResult: ...
 
-    def metrics(self) -> Mapping[str, Any]: ...
+    def metrics(self, *, timeout_seconds: float | None = None) -> EpisodeMetrics: ...
 
-    def shutdown(self) -> Mapping[str, Any]: ...
+    def shutdown(
+        self, *, timeout_seconds: float | None = None
+    ) -> Mapping[str, Any]: ...
+
+
+def _finite_number(value: Any, field: str) -> float:
+    result = _number(value, field)
+    if not math.isfinite(result):
+        raise ProtocolValidationError(f"{field} must be finite")
+    return result

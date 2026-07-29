@@ -102,7 +102,61 @@ def test_timeout_finishes_episode_at_max_steps_without_success():
     )
 
     assert result.to_wire()["state"] == "EPISODE_FINISHED"
-    assert result.to_wire()["metrics"] == {"steps": 1, "success": False}
+    assert result.to_wire()["metrics"] == {
+        "scene_id": "mock-scene",
+        "success": False,
+        "spl": 0.0,
+        "distance_to_goal": 0.5,
+        "steps": 1,
+        "simulator_seconds": 1.0,
+    }
+
+
+def test_success_metrics_compute_spl_from_shortest_distance_and_traveled_path():
+    machine = MockStateMachine()
+    machine.reset("run-id", "mock-000", seed=7, max_steps=3)
+    machine.step(
+        DecisionPayload.from_wire(
+            {
+                "run_id": "run-id",
+                "episode_id": "mock-000",
+                "frame_id": 0,
+                "kind": "continuous_control",
+                "linear_x": 0.75,
+                "angular_z": 0.0,
+            }
+        )
+    )
+    machine.step(
+        DecisionPayload.from_wire(
+            {
+                "run_id": "run-id",
+                "episode_id": "mock-000",
+                "frame_id": 1,
+                "kind": "continuous_control",
+                "linear_x": -0.1,
+                "angular_z": 0.0,
+            }
+        )
+    )
+
+    result = machine.step(
+        DecisionPayload.from_wire(
+            {
+                "run_id": "run-id",
+                "episode_id": "mock-000",
+                "frame_id": 2,
+                "kind": "stop",
+            }
+        )
+    )
+
+    assert result.metrics["scene_id"] == "mock-scene"
+    assert result.metrics["success"] is True
+    assert result.metrics["spl"] == pytest.approx(0.5 / 0.85)
+    assert result.metrics["distance_to_goal"] == pytest.approx(0.15)
+    assert result.metrics["steps"] == 3
+    assert result.metrics["simulator_seconds"] == 3.0
 
 
 def test_rejects_invalid_decisions_without_advancing_the_frame():

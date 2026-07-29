@@ -1,6 +1,6 @@
 [
   {"frame_id": 0, "pose": {"x": 0.0, "y": 0.0, "yaw": 0.0}, "state": "READY"},
-  {"frame_id": 1, "pose": {"x": 0.5, "y": 0.0, "yaw": 0.0}, "state": "READY", "metrics": {"steps": 1, "success": false}},
-  {"frame_id": 2, "pose": {"x": 0.5, "y": 0.0, "yaw": 0.174532925}, "state": "READY", "metrics": {"steps": 2, "success": false}},
-  {"frame_id": 3, "pose": {"x": 0.5, "y": 0.0, "yaw": 0.174532925}, "state": "EPISODE_FINISHED", "metrics": {"steps": 3, "success": true}}
+  {"frame_id": 1, "pose": {"x": 0.5, "y": 0.0, "yaw": 0.0}, "state": "READY", "metrics": {"scene_id": "mock-scene", "success": false, "spl": 0.0, "distance_to_goal": 0.0, "steps": 1, "simulator_seconds": 1.0}},
+  {"frame_id": 2, "pose": {"x": 0.5, "y": 0.0, "yaw": 0.174532925}, "state": "READY", "metrics": {"scene_id": "mock-scene", "success": false, "spl": 0.0, "distance_to_goal": 0.0, "steps": 2, "simulator_seconds": 2.0}},
+  {"frame_id": 3, "pose": {"x": 0.5, "y": 0.0, "yaw": 0.174532925}, "state": "EPISODE_FINISHED", "metrics": {"scene_id": "mock-scene", "success": true, "spl": 1.0, "distance_to_goal": 0.0, "steps": 3, "simulator_seconds": 3.0}}
 ]

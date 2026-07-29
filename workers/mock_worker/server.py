@@ -17,6 +17,7 @@ class MockWorkerServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], state_machine: MockStateMachine | None = None) -> None:
         super().__init__(address, MockWorkerHandler)
         self.state_machine = state_machine or MockStateMachine()
+        self.state_machine_lock = threading.Lock()
 
 
 class MockWorkerHandler(BaseHTTPRequestHandler):
@@ -26,7 +27,7 @@ class MockWorkerHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._respond(HTTPStatus.OK, {"status": "ok"})
         elif self.path == "/metrics":
-            self._dispatch(self.server.state_machine.metrics)
+            self._dispatch(lambda: self.server.state_machine.metrics().to_wire())
         else:
             self._error(HTTPStatus.NOT_FOUND, "not_found", "unknown endpoint")
 
@@ -73,11 +74,14 @@ class MockWorkerHandler(BaseHTTPRequestHandler):
 
     def _dispatch(self, operation) -> None:
         try:
-            self._respond(HTTPStatus.OK, operation())
+            with self.server.state_machine_lock:
+                payload = operation()
         except SessionConflictError as error:
             self._error(HTTPStatus.CONFLICT, error.error, error.detail, error.expected_frame_id)
         except ProtocolValidationError as error:
             self._error(HTTPStatus.BAD_REQUEST, "invalid_request", str(error), self._expected_frame_id())
+        else:
+            self._respond(HTTPStatus.OK, payload)
 
     def _expected_frame_id(self) -> int | None:
         return getattr(self.server.state_machine, "_frame_id", None)

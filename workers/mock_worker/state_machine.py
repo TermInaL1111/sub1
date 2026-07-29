@@ -5,10 +5,10 @@ from __future__ import annotations
 import math
 import random
 import struct
-from typing import Any
 
 from luxinav_sim.backend_protocol import (
     DecisionPayload,
+    EpisodeMetrics,
     ImagePayload,
     Observation,
     ProtocolValidationError,
@@ -31,6 +31,7 @@ class MockStateMachine:
     _SUCCESS_RADIUS = 0.20
     _DISCRETE_FORWARD = 0.25
     _DISCRETE_TURN = math.radians(10)
+    _SCENE_ID = "mock-scene"
 
     def __init__(self) -> None:
         self._run_id: str | None = None
@@ -42,6 +43,7 @@ class MockStateMachine:
         self._x = 0.0
         self._y = 0.0
         self._yaw = 0.0
+        self._path_length = 0.0
         self._finished = False
         self._success = False
 
@@ -61,6 +63,7 @@ class MockStateMachine:
         self._frame_id = 0
         self._steps = 0
         self._x = self._y = self._yaw = 0.0
+        self._path_length = 0.0
         self._finished = self._success = False
         return self._observation()
 
@@ -85,11 +88,24 @@ class MockStateMachine:
             self._finished = True
         elif self._steps >= self._max_steps:
             self._finished = True
-        return StepResult(self._observation(), {"steps": self._steps, "success": self._success})
+        return StepResult(self._observation(), self.metrics())
 
-    def metrics(self) -> dict[str, Any]:
+    def metrics(self) -> EpisodeMetrics:
         self._require_session()
-        return {"steps": self._steps, "success": self._success}
+        shortest_distance = self._GOAL_X
+        spl = (
+            shortest_distance / max(shortest_distance, self._path_length)
+            if self._success
+            else 0.0
+        )
+        return EpisodeMetrics(
+            scene_id=self._SCENE_ID,
+            success=self._success,
+            spl=spl,
+            distance_to_goal=self._distance_to_goal(),
+            steps=self._steps,
+            simulator_seconds=float(self._steps),
+        )
 
     def _validate_session(self, decision: DecisionPayload) -> None:
         self._require_session()
@@ -114,6 +130,7 @@ class MockStateMachine:
         self._x += linear_x * math.cos(self._yaw)
         self._y += linear_x * math.sin(self._yaw)
         self._yaw += angular_z
+        self._path_length += abs(linear_x)
 
     def _distance_to_goal(self) -> float:
         return math.hypot(self._GOAL_X - self._x, -self._y)
