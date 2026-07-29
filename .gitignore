@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ROS 2 / colcon
+build/
+install/
+log/
+
+# Runtime artifacts
+runs/
+bags/
+videos/
+data/
+*.db3
+*.mcap
+*.tmp
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+*.swp
+
+# Superpowers execution scratch
+.superpowers/
