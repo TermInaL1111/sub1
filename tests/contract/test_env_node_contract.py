@@ -743,6 +743,65 @@ def test_outstanding_step_blocks_reuse_and_shutdown_is_serialized_single_shot():
         harness.close()
 
 
+def test_shutdown_prevents_metrics_from_starting_after_phase_change():
+    backend = RecordingBackend()
+    harness = EnvHarness(evaluation_timeout_seconds=1.0, backend=backend)
+    metrics_waiting = threading.Event()
+    release_metrics = threading.Event()
+    original_backend_call = harness.env._backend_call
+
+    def pause_before_metrics(operation, deadline, *args, **kwargs):
+        if operation == backend.metrics:
+            metrics_waiting.set()
+            assert release_metrics.wait(timeout=1.0)
+        return original_backend_call(operation, deadline, *args, **kwargs)
+
+    harness.env._backend_call = pause_before_metrics
+    try:
+        evaluation = harness.start_episode(max_steps=1)
+        harness.publish_decision()
+        assert metrics_waiting.wait(timeout=1.0)
+
+        shutdown = harness.shutdown_client.call_async(Trigger.Request())
+        harness.wait_for(lambda: harness.env.shutdown_requested)
+        shutdown_response = harness.wait_future(shutdown)
+        release_metrics.set()
+        evaluation_response = harness.wait_future(evaluation)
+
+        assert shutdown_response.success is True
+        assert "shutting down" in evaluation_response.error
+        assert not any(name == "metrics" for name, _ in backend.timeouts)
+        assert backend.shutdown_calls == 1
+    finally:
+        release_metrics.set()
+        harness.close()
+
+
+def test_failed_shutdown_is_attempted_exactly_once_across_trigger_and_close():
+    class FailingShutdownBackend(RecordingBackend):
+        def shutdown(self, *, timeout_seconds=None):
+            self.shutdown_calls += 1
+            raise RuntimeError("partial shutdown failure")
+
+    backend = FailingShutdownBackend()
+    harness = EnvHarness(backend=backend)
+    try:
+        first = harness.wait_future(
+            harness.shutdown_client.call_async(Trigger.Request())
+        )
+        second = harness.wait_future(
+            harness.shutdown_client.call_async(Trigger.Request())
+        )
+        harness.env.close()
+
+        assert first.success is False
+        assert second.success is False
+        assert first.message == second.message == "partial shutdown failure"
+        assert backend.shutdown_calls == 1
+    finally:
+        harness.close()
+
+
 def test_terminal_reset_returns_without_ready_or_deadline_wait():
     class TerminalResetBackend(RecordingBackend):
         def reset(

@@ -158,7 +158,8 @@ class EnvNode(Node):
         self._generation = 0
         self._episode: _Episode | None = None
         self._last_stamp_ns = -1
-        self._backend_shutdown_done = False
+        self._backend_shutdown_attempted = False
+        self._backend_shutdown_error = ""
         self._backend_shutdown_result: Mapping[str, Any] = {
             "status": "shutting_down"
         }
@@ -180,12 +181,19 @@ class EnvNode(Node):
         operation: Callable[..., _Result],
         deadline: float,
         *args,
+        allow_shutdown: bool = False,
         **kwargs,
     ) -> _Result:
         remaining = self._remaining(deadline)
         if not self._backend_lock.acquire(timeout=remaining):
             raise TimeoutError("evaluation deadline exceeded waiting for backend")
         try:
+            with self._condition:
+                if (
+                    not allow_shutdown and
+                    self._phase in {self._SHUTTING_DOWN, self._SHUTDOWN}
+                ):
+                    raise RuntimeError("environment is shutting down")
             kwargs["timeout_seconds"] = self._remaining(deadline)
             try:
                 return operation(*args, **kwargs)
@@ -483,18 +491,29 @@ class EnvNode(Node):
 
     def _shutdown_backend(self, deadline: float) -> Mapping[str, Any]:
         with self._shutdown_once_lock:
-            if self._backend_shutdown_done:
+            if self._backend_shutdown_attempted:
+                if self._backend_shutdown_error:
+                    raise RuntimeError(self._backend_shutdown_error)
                 return self._backend_shutdown_result
-            result = self._backend_call(
-                self._backend.shutdown,
-                deadline,
-            )
-            with self._condition:
-                self._backend_shutdown_result = result
-                self._backend_shutdown_done = True
-                self._phase = self._SHUTDOWN
-                self._condition.notify_all()
-            return result
+            self._backend_shutdown_attempted = True
+            try:
+                result = self._backend_call(
+                    self._backend.shutdown,
+                    deadline,
+                    allow_shutdown=True,
+                )
+            except Exception as error:
+                with self._condition:
+                    self._backend_shutdown_error = str(error)
+                    self._phase = self._SHUTDOWN
+                    self._condition.notify_all()
+                raise
+            else:
+                with self._condition:
+                    self._backend_shutdown_result = result
+                    self._phase = self._SHUTDOWN
+                    self._condition.notify_all()
+                return result
 
     def close(self) -> None:
         """Terminalize active work and shut down the backend exactly once."""
