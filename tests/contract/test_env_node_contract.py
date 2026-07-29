@@ -6,6 +6,7 @@ from geometry_msgs.msg import PoseStamped
 from luxinav_interfaces.msg import Decision, EpisodeState, RunContext
 from luxinav_interfaces.srv import EvaluateEpisode, Readiness
 from luxinav_sim.backend_protocol import (
+    EpisodeMetrics,
     ImagePayload,
     Observation,
     StepResult,
@@ -50,11 +51,22 @@ class RecordingBackend:
         self._max_steps = 0
         self._steps = 0
         self._success = False
+        self.timeouts = []
 
-    def health(self):
+    def health(self, *, timeout_seconds=None):
+        self.timeouts.append(("health", timeout_seconds))
         return {"status": "ok"}
 
-    def reset(self, run_id, episode_id, seed, max_steps):
+    def reset(
+        self,
+        run_id,
+        episode_id,
+        seed,
+        max_steps,
+        *,
+        timeout_seconds=None,
+    ):
+        self.timeouts.append(("reset", timeout_seconds))
         self.reset_calls.append((run_id, episode_id, seed, max_steps))
         self._run_id = run_id
         self._episode_id = episode_id
@@ -63,7 +75,8 @@ class RecordingBackend:
         self._success = False
         return _observation(run_id, episode_id, 0)
 
-    def step(self, decision):
+    def step(self, decision, *, timeout_seconds=None):
+        self.timeouts.append(("step", timeout_seconds))
         self.step_calls.append(decision)
         self._steps += 1
         terminal = decision.kind == "stop" or self._steps >= self._max_steps
@@ -75,21 +88,106 @@ class RecordingBackend:
                 self._steps,
                 terminal=terminal,
             ),
-            {"steps": self._steps, "success": self._success},
+            self._metrics(),
         )
 
-    def metrics(self):
-        return {
-            "steps": self._steps,
-            "success": self._success,
-            "spl": 0.25,
-            "distance_to_goal": 0.125,
-            "simulator_seconds": 1.5,
-        }
+    def metrics(self, *, timeout_seconds=None):
+        self.timeouts.append(("metrics", timeout_seconds))
+        return self._metrics()
 
-    def shutdown(self):
+    def shutdown(self, *, timeout_seconds=None):
+        self.timeouts.append(("shutdown", timeout_seconds))
         self.shutdown_calls += 1
         return {"status": "shutting_down"}
+
+    def _metrics(self):
+        return EpisodeMetrics(
+            scene_id="mock-scene",
+            success=self._success,
+            spl=0.25,
+            distance_to_goal=0.125,
+            steps=self._steps,
+            simulator_seconds=1.5,
+        )
+
+
+class BlockingBackend(RecordingBackend):
+    def __init__(self, *, block_operation):
+        super().__init__()
+        self.block_operation = block_operation
+        self.operation_started = threading.Event()
+        self.operation_finished = threading.Event()
+        self.release_operation = threading.Event()
+        self._active_lock = threading.Lock()
+        self._active_calls = 0
+        self.max_active_calls = 0
+
+    def _enter(self):
+        with self._active_lock:
+            self._active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self._active_calls)
+
+    def _leave(self):
+        with self._active_lock:
+            self._active_calls -= 1
+
+    def _block(self, timeout_seconds):
+        self.operation_started.set()
+        completed = self.release_operation.wait(timeout_seconds or 2.0)
+        self.operation_finished.set()
+        if not completed:
+            raise TimeoutError(f"{self.block_operation} timed out")
+
+    def reset(
+        self,
+        run_id,
+        episode_id,
+        seed,
+        max_steps,
+        *,
+        timeout_seconds=None,
+    ):
+        self._enter()
+        try:
+            if self.block_operation == "reset":
+                self.timeouts.append(("reset", timeout_seconds))
+                self._block(timeout_seconds)
+            return super().reset(
+                run_id,
+                episode_id,
+                seed,
+                max_steps,
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            self._leave()
+
+    def step(self, decision, *, timeout_seconds=None):
+        self._enter()
+        try:
+            if self.block_operation == "step":
+                self.timeouts.append(("step", timeout_seconds))
+                self._block(timeout_seconds)
+            return super().step(decision, timeout_seconds=timeout_seconds)
+        finally:
+            self._leave()
+
+    def metrics(self, *, timeout_seconds=None):
+        self._enter()
+        try:
+            if self.block_operation == "metrics":
+                self.timeouts.append(("metrics", timeout_seconds))
+                self._block(timeout_seconds)
+            return super().metrics(timeout_seconds=timeout_seconds)
+        finally:
+            self._leave()
+
+    def shutdown(self, *, timeout_seconds=None):
+        self._enter()
+        try:
+            return super().shutdown(timeout_seconds=timeout_seconds)
+        finally:
+            self._leave()
 
 
 class EnvHarness:
@@ -334,6 +432,7 @@ def test_frame_identity_rejects_stale_foreign_and_duplicate_decisions(env_harnes
     ] == [("r1", "mock-000", 0)]
     assert response.accepted is True
     assert response.episode_id == "mock-000"
+    assert response.scene_id == "mock-scene"
     assert response.steps == 1
     assert response.success is False
     assert response.spl == 0.25
@@ -487,7 +586,15 @@ def test_control_services_observe_backend_and_evaluation_deadline():
 
 def test_failed_backend_reset_is_not_reported_as_an_accepted_start():
     class FailingResetBackend(RecordingBackend):
-        def reset(self, run_id, episode_id, seed, max_steps):
+        def reset(
+            self,
+            run_id,
+            episode_id,
+            seed,
+            max_steps,
+            *,
+            timeout_seconds=None,
+        ):
             raise RuntimeError("reset unavailable")
 
     harness = EnvHarness(backend=FailingResetBackend())
@@ -503,5 +610,186 @@ def test_failed_backend_reset_is_not_reported_as_an_accepted_start():
         assert response.accepted is False
         assert response.error == "reset unavailable"
         assert harness.messages["context"] == []
+    finally:
+        harness.close()
+
+
+def test_deadline_during_step_has_one_terminal_and_no_post_terminal_publication():
+    backend = BlockingBackend(block_operation="step")
+    harness = EnvHarness(evaluation_timeout_seconds=0.15, backend=backend)
+    try:
+        evaluation = harness.start_episode(max_steps=2)
+        harness.publish_decision()
+        assert backend.operation_started.wait(timeout=1.0)
+        response = harness.wait_future(evaluation, timeout=1.0)
+        harness.wait_for(
+            lambda: any(
+                state.state == EpisodeState.EPISODE_FINISHED
+                for state in harness.messages["state"]
+            )
+        )
+        backend.release_operation.set()
+        assert backend.operation_finished.wait(timeout=1.0)
+        time.sleep(0.1)
+
+        assert "deadline" in response.error
+        assert [context.frame_id for context in harness.messages["context"]] == [0]
+        assert [
+            (state.state, state.context.frame_id)
+            for state in harness.messages["state"]
+        ] == [
+            (EpisodeState.READY, 0),
+            (EpisodeState.RUNNING, 0),
+            (EpisodeState.EPISODE_FINISHED, 0),
+        ]
+        assert backend.max_active_calls == 1
+        assert 0.0 < dict(backend.timeouts)["step"] <= 0.15
+    finally:
+        backend.release_operation.set()
+        harness.close()
+
+
+@pytest.mark.parametrize("operation", ["reset", "metrics"])
+def test_reset_and_metrics_share_the_end_to_end_episode_deadline(operation):
+    backend = BlockingBackend(block_operation=operation)
+    harness = EnvHarness(evaluation_timeout_seconds=0.15, backend=backend)
+    try:
+        started = time.monotonic()
+        evaluation = harness.evaluate_client.call_async(
+            EvaluateEpisode.Request(
+                run_id="slow-run",
+                episode_selector="mock-000",
+                max_steps=1,
+            )
+        )
+        if operation == "metrics":
+            harness.wait_for(
+                lambda: any(
+                    state.state == EpisodeState.READY
+                    for state in harness.messages["state"]
+                )
+            )
+            harness.publish_decision(run_id="slow-run")
+        assert backend.operation_started.wait(timeout=1.0)
+        completed_in_time = False
+        try:
+            response = harness.wait_future(evaluation, timeout=0.5)
+            completed_in_time = time.monotonic() - started < 0.45
+        finally:
+            backend.release_operation.set()
+
+        assert completed_in_time
+        assert "deadline" in response.error
+        if operation == "reset":
+            assert response.accepted is False
+        else:
+            assert response.accepted is True
+        timeout = [value for name, value in backend.timeouts if name == operation][0]
+        assert 0.0 < timeout <= 0.15
+    finally:
+        backend.release_operation.set()
+        harness.close()
+
+
+def test_outstanding_step_blocks_reuse_and_shutdown_is_serialized_single_shot():
+    backend = BlockingBackend(block_operation="step")
+    harness = EnvHarness(evaluation_timeout_seconds=1.0, backend=backend)
+    try:
+        evaluation = harness.start_episode(max_steps=2)
+        harness.publish_decision()
+        assert backend.operation_started.wait(timeout=1.0)
+
+        shutdown = harness.shutdown_client.call_async(Trigger.Request())
+        harness.wait_for(
+            lambda: any(
+                state.state == EpisodeState.EPISODE_FINISHED and
+                "shutdown" in state.detail
+                for state in harness.messages["state"]
+            ),
+            timeout=0.5,
+        )
+        second = harness.evaluate_client.call_async(
+            EvaluateEpisode.Request(
+                run_id="second",
+                episode_selector="mock-001",
+                max_steps=1,
+            )
+        )
+        second_response = harness.wait_future(second)
+        assert second_response.accepted is False
+        assert "shutting down" in second_response.error
+        assert shutdown.done() is False
+
+        backend.release_operation.set()
+        shutdown_response = harness.wait_future(shutdown)
+        evaluation_response = harness.wait_future(evaluation)
+        repeated_shutdown = harness.wait_future(
+            harness.shutdown_client.call_async(Trigger.Request())
+        )
+
+        assert shutdown_response.success is True
+        assert repeated_shutdown.success is True
+        assert backend.shutdown_calls == 1
+        assert backend.max_active_calls == 1
+        assert "shutdown" in evaluation_response.error
+        harness.wait_for(
+            lambda: sum(
+                state.state == EpisodeState.EPISODE_FINISHED
+                for state in harness.messages["state"]
+            ) == 1
+        )
+    finally:
+        backend.release_operation.set()
+        harness.close()
+
+
+def test_terminal_reset_returns_without_ready_or_deadline_wait():
+    class TerminalResetBackend(RecordingBackend):
+        def reset(
+            self,
+            run_id,
+            episode_id,
+            seed,
+            max_steps,
+            *,
+            timeout_seconds=None,
+        ):
+            observation = super().reset(
+                run_id,
+                episode_id,
+                seed,
+                max_steps,
+                timeout_seconds=timeout_seconds,
+            )
+            return _observation(
+                observation.run_id,
+                observation.episode_id,
+                observation.frame_id,
+                terminal=True,
+            )
+
+    harness = EnvHarness(
+        evaluation_timeout_seconds=0.5,
+        backend=TerminalResetBackend(),
+    )
+    try:
+        started = time.monotonic()
+        response = harness.wait_future(
+            harness.evaluate_client.call_async(
+                EvaluateEpisode.Request(
+                    run_id="terminal-run",
+                    episode_selector="mock-000",
+                    max_steps=1,
+                )
+            )
+        )
+        harness.wait_for(lambda: len(harness.messages["state"]) == 1)
+
+        assert time.monotonic() - started < 0.3
+        assert response.accepted is True
+        assert [
+            (state.state, state.context.frame_id)
+            for state in harness.messages["state"]
+        ] == [(EpisodeState.EPISODE_FINISHED, 0)]
     finally:
         harness.close()

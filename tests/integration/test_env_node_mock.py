@@ -130,7 +130,14 @@ def test_real_mock_http_backend_drives_one_ros_frame_transition():
             (call.run_id, call.episode_id, call.frame_id)
             for call in machine.step_calls
         ] == [("integration-run", "mock-000", 0)]
-        assert backend.metrics() == {"steps": 1, "success": False}
+        assert backend.metrics() == {
+            "scene_id": "mock-scene",
+            "success": False,
+            "spl": 0.0,
+            "distance_to_goal": 0.5,
+            "steps": 1,
+            "simulator_seconds": 1.0,
+        }
         assert response.accepted is True
         assert response.episode_id == "mock-000"
         assert response.steps == 1

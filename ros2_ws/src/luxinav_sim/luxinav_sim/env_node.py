@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-import math
+from dataclasses import dataclass
 import threading
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, TypeVar
 
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import PoseStamped
@@ -25,7 +24,7 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
-from .backend_protocol import EnvironmentBackend, Observation
+from .backend_protocol import EnvironmentBackend, EpisodeMetrics, Observation
 from .http_backend import HttpEnvironmentBackend
 from .ros_conversion import (
     decision_payload,
@@ -37,22 +36,34 @@ from .ros_conversion import (
 )
 
 
+_Result = TypeVar("_Result")
+
+
 @dataclass
 class _Episode:
+    generation: int
     run_id: str
     episode_id: str
     observation: Observation
     context: RunContext
-    metrics: dict[str, Any] = field(
-        default_factory=lambda: {"steps": 0, "success": False}
-    )
-    decision_in_flight: bool = False
+    deadline: float
+    metrics: EpisodeMetrics | None = None
+    operation_in_flight: bool = False
     terminal: bool = False
+    terminal_published: bool = False
+    service_released: bool = False
     error: str = ""
 
 
 class EnvNode(Node):
     """Expose one backend episode at a time through canonical LuxiNav endpoints."""
+
+    _IDLE = "IDLE"
+    _RESETTING = "RESETTING"
+    _ACTIVE = "ACTIVE"
+    _DRAINING = "DRAINING"
+    _SHUTTING_DOWN = "SHUTTING_DOWN"
+    _SHUTDOWN = "SHUTDOWN"
 
     def __init__(
         self,
@@ -141,34 +152,66 @@ class EnvNode(Node):
         )
 
         self._condition = threading.Condition()
-        self._evaluation_active = False
+        self._backend_lock = threading.Lock()
+        self._shutdown_once_lock = threading.Lock()
+        self._phase = self._IDLE
+        self._generation = 0
         self._episode: _Episode | None = None
         self._last_stamp_ns = -1
-        self._shutdown_requested = False
+        self._backend_shutdown_done = False
+        self._backend_shutdown_result: Mapping[str, Any] = {
+            "status": "shutting_down"
+        }
 
     @property
     def shutdown_requested(self) -> bool:
-        return self._shutdown_requested
-
-    def _next_stamp(self) -> Time:
-        now_ns = self.get_clock().now().nanoseconds
         with self._condition:
-            stamp_ns = max(now_ns, self._last_stamp_ns + 1)
-            self._last_stamp_ns = stamp_ns
+            return self._phase in {self._SHUTTING_DOWN, self._SHUTDOWN}
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError("evaluation deadline exceeded")
+        return remaining
+
+    def _backend_call(
+        self,
+        operation: Callable[..., _Result],
+        deadline: float,
+        *args,
+        **kwargs,
+    ) -> _Result:
+        remaining = self._remaining(deadline)
+        if not self._backend_lock.acquire(timeout=remaining):
+            raise TimeoutError("evaluation deadline exceeded waiting for backend")
+        try:
+            kwargs["timeout_seconds"] = self._remaining(deadline)
+            try:
+                return operation(*args, **kwargs)
+            except TimeoutError as error:
+                raise TimeoutError("evaluation deadline exceeded") from error
+        finally:
+            self._backend_lock.release()
+
+    def _next_stamp_locked(self) -> Time:
+        now_ns = self.get_clock().now().nanoseconds
+        stamp_ns = max(now_ns, self._last_stamp_ns + 1)
+        self._last_stamp_ns = stamp_ns
         return Time(
             sec=stamp_ns // 1_000_000_000,
             nanosec=stamp_ns % 1_000_000_000,
         )
 
-    def _context_for(self, observation: Observation) -> RunContext:
+    def _context_for_locked(self, observation: Observation) -> RunContext:
         return run_context(
             observation,
-            self._next_stamp(),
+            self._next_stamp_locked(),
             contract_version=self._contract_version,
             source_plugin_id=self._source_plugin_id,
         )
 
-    def _publish_observation(
+    def _publish_observation_locked(
         self, observation: Observation, context: RunContext
     ) -> None:
         stamp = context.stamp
@@ -179,7 +222,7 @@ class EnvNode(Node):
         self._odometry_pub.publish(odometry_message(observation, stamp))
         self._goal_pub.publish(goal_text_message(observation))
 
-    def _publish_state(
+    def _publish_state_locked(
         self, context: RunContext, state: int, steps: int, detail: str = ""
     ) -> None:
         self._state_pub.publish(
@@ -191,11 +234,49 @@ class EnvNode(Node):
             )
         )
 
+    def _terminalize_locked(self, episode: _Episode, error: str = "") -> None:
+        if episode.terminal:
+            return
+        episode.terminal = True
+        episode.error = error
+        if not episode.terminal_published:
+            steps = 0 if episode.metrics is None else episode.metrics.steps
+            self._publish_state_locked(
+                episode.context,
+                EpisodeState.EPISODE_FINISHED,
+                steps,
+                error,
+            )
+            episode.terminal_published = True
+        self._condition.notify_all()
+
+    def _release_episode_locked(self, episode: _Episode) -> None:
+        if self._episode is not episode:
+            return
+        self._episode = None
+        if self._phase not in {self._SHUTTING_DOWN, self._SHUTDOWN}:
+            self._phase = self._IDLE
+        self._condition.notify_all()
+
+    def _finish_drain_locked(self, episode: _Episode) -> None:
+        episode.operation_in_flight = False
+        if episode.service_released:
+            self._release_episode_locked(episode)
+        else:
+            self._condition.notify_all()
+
     def _on_readiness(self, request, response):
         del request
         response.component_id = self._source_plugin_id
+        with self._condition:
+            if self._phase in {self._SHUTTING_DOWN, self._SHUTDOWN}:
+                response.ready = False
+                response.status = "shutting_down"
+                response.error = "environment is shutting down"
+                return response
         try:
-            health = self._backend.health()
+            deadline = time.monotonic() + self._evaluation_timeout_seconds
+            health = self._backend_call(self._backend.health, deadline)
             response.status = str(health.get("status", "unknown"))
             response.ready = response.status == "ok"
             if not response.ready:
@@ -206,101 +287,124 @@ class EnvNode(Node):
             response.error = str(error)
         return response
 
-    def _on_evaluate_episode(self, request, response):
+    def _reserve_evaluation(self, response) -> int | None:
         with self._condition:
-            if self._evaluation_active:
+            if self._phase in {self._SHUTTING_DOWN, self._SHUTDOWN}:
+                response.accepted = False
+                response.error = "environment is shutting down"
+                return None
+            if self._phase != self._IDLE:
                 response.accepted = False
                 response.error = "an evaluation is already active"
-                return response
-            self._evaluation_active = True
+                return None
+            self._generation += 1
+            self._phase = self._RESETTING
+            return self._generation
 
+    def _on_evaluate_episode(self, request, response):
+        deadline = time.monotonic() + self._evaluation_timeout_seconds
+        generation = self._reserve_evaluation(response)
+        if generation is None:
+            return response
         if not request.run_id or not request.episode_selector or request.max_steps < 1:
             with self._condition:
-                self._evaluation_active = False
-                self._condition.notify_all()
+                if self._phase == self._RESETTING:
+                    self._phase = self._IDLE
             response.accepted = False
             response.error = (
                 "run_id, episode_selector, and a positive max_steps are required"
             )
             return response
 
-        started = time.monotonic()
-        episode_started = False
+        episode: _Episode | None = None
+        metrics: EpisodeMetrics | None = None
+        error = ""
         try:
-            observation = self._backend.reset(
+            observation = self._backend_call(
+                self._backend.reset,
+                deadline,
                 request.run_id,
                 request.episode_selector,
                 seed=0,
                 max_steps=request.max_steps,
             )
-            context = self._context_for(observation)
-            episode = _Episode(
-                run_id=observation.run_id,
-                episode_id=observation.episode_id,
-                observation=observation,
-                context=context,
-            )
-            episode_started = True
-            response.accepted = True
             with self._condition:
+                if (
+                    self._generation != generation or
+                    self._phase in {self._SHUTTING_DOWN, self._SHUTDOWN}
+                ):
+                    raise RuntimeError("environment shutdown interrupted reset")
+                context = self._context_for_locked(observation)
+                episode = _Episode(
+                    generation=generation,
+                    run_id=observation.run_id,
+                    episode_id=observation.episode_id,
+                    observation=observation,
+                    context=context,
+                    deadline=deadline,
+                )
                 self._episode = episode
-            self._publish_observation(observation, context)
-            self._publish_state(context, EpisodeState.READY, 0)
+                self._phase = self._ACTIVE
+                response.accepted = True
+                self._publish_observation_locked(observation, context)
+                if observation.state == "EPISODE_FINISHED":
+                    self._terminalize_locked(episode)
+                else:
+                    self._publish_state_locked(
+                        context, EpisodeState.READY, 0
+                    )
 
-            deadline = started + self._evaluation_timeout_seconds
-            with self._condition:
                 while not episode.terminal:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0.0:
-                        episode.terminal = True
-                        episode.error = "evaluation deadline exceeded"
-                        self._publish_state(
-                            episode.context,
-                            EpisodeState.EPISODE_FINISHED,
-                            int(episode.metrics.get("steps", 0)),
-                            episode.error,
+                        self._terminalize_locked(
+                            episode, "evaluation deadline exceeded"
                         )
+                        if episode.operation_in_flight:
+                            self._phase = self._DRAINING
                         break
                     self._condition.wait(timeout=remaining)
-                metrics = dict(episode.metrics)
-                final_observation = episode.observation
+                metrics = episode.metrics
                 error = episode.error
-            try:
-                metrics.update(dict(self._backend.metrics()))
-            except Exception as metrics_error:
-                if not error:
+
+            if not error:
+                try:
+                    metrics = self._backend_call(
+                        self._backend.metrics, deadline
+                    )
+                except Exception as metrics_error:
                     error = f"final metrics unavailable: {metrics_error}"
         except Exception as exception:
-            metrics = {"steps": 0, "success": False}
-            final_observation = None
             error = str(exception)
-            if not episode_started:
+            if episode is None:
                 response.accepted = False
         finally:
             with self._condition:
-                self._episode = None
-                self._evaluation_active = False
-                self._condition.notify_all()
+                if episode is None:
+                    if self._phase == self._RESETTING:
+                        self._phase = self._IDLE
+                elif episode.operation_in_flight:
+                    episode.service_released = True
+                    if self._phase not in {
+                        self._SHUTTING_DOWN,
+                        self._SHUTDOWN,
+                    }:
+                        self._phase = self._DRAINING
+                else:
+                    self._release_episode_locked(episode)
 
         response.episode_id = (
             request.episode_selector
-            if final_observation is None
-            else final_observation.episode_id
+            if episode is None
+            else episode.observation.episode_id
         )
-        response.scene_id = self._source_plugin_id
-        response.success = bool(metrics.get("success", False))
-        response.spl = float(metrics.get("spl", 1.0 if response.success else 0.0))
-        response.steps = int(metrics.get("steps", 0))
-        response.simulator_seconds = float(metrics.get("simulator_seconds", 0.0))
-        if "distance_to_goal" in metrics:
-            response.distance_to_goal = float(metrics["distance_to_goal"])
-        elif final_observation is not None:
-            response.distance_to_goal = math.hypot(
-                float(final_observation.goal["x"]) -
-                float(final_observation.pose["x"]),
-                float(final_observation.goal["y"]) -
-                float(final_observation.pose["y"]),
-            )
+        if metrics is not None:
+            response.scene_id = metrics.scene_id
+            response.success = metrics.success
+            response.spl = metrics.spl
+            response.distance_to_goal = metrics.distance_to_goal
+            response.steps = metrics.steps
+            response.simulator_seconds = metrics.simulator_seconds
         response.error = error
         return response
 
@@ -308,9 +412,10 @@ class EnvNode(Node):
         with self._condition:
             episode = self._episode
             if (
+                self._phase != self._ACTIVE or
                 episode is None or
                 episode.terminal or
-                episode.decision_in_flight or
+                episode.operation_in_flight or
                 message.context.run_id != episode.run_id or
                 message.context.episode_id != episode.episode_id or
                 message.context.frame_id != episode.context.frame_id
@@ -321,63 +426,95 @@ class EnvNode(Node):
             except ValueError as error:
                 self.get_logger().warning(str(error))
                 return
-            episode.decision_in_flight = True
-            current_context = episode.context
-            current_steps = int(episode.metrics.get("steps", 0))
+            episode.operation_in_flight = True
+            steps = 0 if episode.metrics is None else episode.metrics.steps
+            self._publish_state_locked(
+                episode.context, EpisodeState.RUNNING, steps
+            )
 
-        self._publish_state(
-            current_context, EpisodeState.RUNNING, current_steps
-        )
         try:
-            result = self._backend.step(payload)
-            next_context = self._context_for(result.observation)
+            result = self._backend_call(
+                self._backend.step,
+                episode.deadline,
+                payload,
+            )
         except Exception as error:
             with self._condition:
                 if self._episode is episode:
-                    episode.decision_in_flight = False
-                    episode.terminal = True
-                    episode.error = str(error)
-                    self._publish_state(
-                        episode.context,
-                        EpisodeState.FAILED,
-                        current_steps,
-                        episode.error,
-                    )
-                    self._condition.notify_all()
+                    if not episode.terminal:
+                        self._terminalize_locked(episode, str(error))
+                    self._finish_drain_locked(episode)
             return
 
         with self._condition:
-            if self._episode is not episode or episode.terminal:
+            if self._episode is not episode:
                 return
+            if episode.terminal or self._phase != self._ACTIVE:
+                self._finish_drain_locked(episode)
+                return
+
+            next_context = self._context_for_locked(result.observation)
             episode.observation = result.observation
             episode.context = next_context
-            episode.metrics = dict(result.metrics)
-            episode.decision_in_flight = False
-            steps = int(episode.metrics.get("steps", 0))
+            episode.metrics = result.metrics
+            episode.operation_in_flight = False
             terminal = (
                 result.observation.state == "EPISODE_FINISHED" or
-                bool(episode.metrics.get("success", False)) or
+                result.metrics.success or
                 payload.kind == "stop"
             )
+            self._publish_observation_locked(result.observation, next_context)
+            self._publish_state_locked(
+                next_context,
+                EpisodeState.ACTION_FINISHED,
+                result.metrics.steps,
+            )
+            if terminal:
+                self._terminalize_locked(episode)
 
-        self._publish_observation(result.observation, next_context)
-        self._publish_state(next_context, EpisodeState.ACTION_FINISHED, steps)
-        if terminal:
-            self._publish_state(
-                next_context, EpisodeState.EPISODE_FINISHED, steps
+    def _begin_shutdown(self, reason: str) -> None:
+        with self._condition:
+            if self._phase == self._SHUTDOWN:
+                return
+            self._phase = self._SHUTTING_DOWN
+            if self._episode is not None:
+                self._terminalize_locked(self._episode, reason)
+            self._condition.notify_all()
+
+    def _shutdown_backend(self, deadline: float) -> Mapping[str, Any]:
+        with self._shutdown_once_lock:
+            if self._backend_shutdown_done:
+                return self._backend_shutdown_result
+            result = self._backend_call(
+                self._backend.shutdown,
+                deadline,
             )
             with self._condition:
-                if self._episode is episode:
-                    episode.terminal = True
-                    self._condition.notify_all()
+                self._backend_shutdown_result = result
+                self._backend_shutdown_done = True
+                self._phase = self._SHUTDOWN
+                self._condition.notify_all()
+            return result
+
+    def close(self) -> None:
+        """Terminalize active work and shut down the backend exactly once."""
+        self._begin_shutdown("process shutdown")
+        try:
+            self._shutdown_backend(
+                time.monotonic() + self._evaluation_timeout_seconds
+            )
+        except Exception as error:
+            self.get_logger().error(f"backend shutdown failed: {error}")
 
     def _on_shutdown(self, request, response):
         del request
+        self._begin_shutdown("shutdown requested")
         try:
-            result: Mapping[str, Any] = self._backend.shutdown()
+            result = self._shutdown_backend(
+                time.monotonic() + self._evaluation_timeout_seconds
+            )
             response.success = True
             response.message = str(result.get("status", "shutting_down"))
-            self._shutdown_requested = True
         except Exception as error:
             response.success = False
             response.message = str(error)
@@ -393,6 +530,7 @@ def main(args=None) -> None:
         while rclpy.ok() and not node.shutdown_requested:
             executor.spin_once(timeout_sec=0.1)
     finally:
+        node.close()
         executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
