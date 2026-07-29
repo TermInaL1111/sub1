@@ -182,6 +182,7 @@ class EnvNode(Node):
         deadline: float,
         *args,
         allow_shutdown: bool = False,
+        on_reserved: Callable[[], None] | None = None,
         **kwargs,
     ) -> _Result:
         remaining = self._remaining(deadline)
@@ -194,7 +195,10 @@ class EnvNode(Node):
                     self._phase in {self._SHUTTING_DOWN, self._SHUTDOWN}
                 ):
                     raise RuntimeError("environment is shutting down")
-            kwargs["timeout_seconds"] = self._remaining(deadline)
+            timeout_seconds = self._remaining(deadline)
+            if on_reserved is not None:
+                on_reserved()
+            kwargs["timeout_seconds"] = timeout_seconds
             try:
                 return operation(*args, **kwargs)
             except TimeoutError as error:
@@ -495,17 +499,22 @@ class EnvNode(Node):
                 if self._backend_shutdown_error:
                     raise RuntimeError(self._backend_shutdown_error)
                 return self._backend_shutdown_result
-            self._backend_shutdown_attempted = True
+
+            def mark_attempted() -> None:
+                self._backend_shutdown_attempted = True
+
             try:
                 result = self._backend_call(
                     self._backend.shutdown,
                     deadline,
                     allow_shutdown=True,
+                    on_reserved=mark_attempted,
                 )
             except Exception as error:
                 with self._condition:
-                    self._backend_shutdown_error = str(error)
-                    self._phase = self._SHUTDOWN
+                    if self._backend_shutdown_attempted:
+                        self._backend_shutdown_error = str(error)
+                        self._phase = self._SHUTDOWN
                     self._condition.notify_all()
                 raise
             else:

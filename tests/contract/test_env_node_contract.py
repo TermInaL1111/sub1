@@ -802,6 +802,30 @@ def test_failed_shutdown_is_attempted_exactly_once_across_trigger_and_close():
         harness.close()
 
 
+def test_shutdown_lock_timeout_can_retry_before_backend_invocation():
+    backend = RecordingBackend()
+    harness = EnvHarness(evaluation_timeout_seconds=0.1, backend=backend)
+    harness.env._backend_lock.acquire()
+    try:
+        first = harness.wait_future(
+            harness.shutdown_client.call_async(Trigger.Request())
+        )
+        assert first.success is False
+        assert "deadline" in first.message
+        assert backend.shutdown_calls == 0
+    finally:
+        harness.env._backend_lock.release()
+
+    try:
+        second = harness.wait_future(
+            harness.shutdown_client.call_async(Trigger.Request())
+        )
+        assert second.success is True
+        assert backend.shutdown_calls == 1
+    finally:
+        harness.close()
+
+
 def test_terminal_reset_returns_without_ready_or_deadline_wait():
     class TerminalResetBackend(RecordingBackend):
         def reset(
