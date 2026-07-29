@@ -12,9 +12,59 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from luxinav_sim.backend_protocol import ImagePayload, ProtocolValidationError
+from luxinav_sim.backend_protocol import (
+    DecisionPayload,
+    EnvironmentBackend,
+    ImagePayload,
+    Observation,
+    ProtocolValidationError,
+    StepResult,
+)
 from luxinav_sim.http_backend import BackendHttpError, HttpEnvironmentBackend
 from workers.mock_worker.server import create_server
+
+
+class ConformingFakeBackend:
+    def __init__(self):
+        self.observation = Observation(
+            run_id="run-a",
+            episode_id="mock-000",
+            frame_id=0,
+            rgb=ImagePayload(1, 1, "rgb8", b"\x00" * 3),
+            depth=ImagePayload(1, 1, "32FC1", b"\x00" * 4),
+            pose={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            goal={"text": "mock target", "x": 0.5, "y": 0.0},
+            state="READY",
+        )
+
+    def health(self):
+        return {"status": "ok"}
+
+    def reset(self, run_id, episode_id, seed, max_steps):
+        return self.observation
+
+    def step(self, decision):
+        return StepResult(self.observation, {"steps": 0, "success": False})
+
+    def metrics(self):
+        return {"steps": 0, "success": False}
+
+    def shutdown(self):
+        return {"status": "shutting_down"}
+
+
+def test_environment_backend_protocol_accepts_complete_fake_and_http_client():
+    fake = ConformingFakeBackend()
+    http = HttpEnvironmentBackend("http://127.0.0.1:1")
+    decision = DecisionPayload("run-a", "mock-000", 0, "stop")
+
+    assert isinstance(fake, EnvironmentBackend)
+    assert isinstance(http, EnvironmentBackend)
+    assert fake.health() == {"status": "ok"}
+    assert fake.reset("run-a", "mock-000", seed=7, max_steps=3) is fake.observation
+    assert fake.step(decision).observation is fake.observation
+    assert fake.metrics() == {"steps": 0, "success": False}
+    assert fake.shutdown() == {"status": "shutting_down"}
 
 
 @pytest.fixture

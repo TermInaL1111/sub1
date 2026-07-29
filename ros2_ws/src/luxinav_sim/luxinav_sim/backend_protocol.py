@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 
 class ProtocolValidationError(ValueError):
@@ -213,3 +213,20 @@ class StepResult:
 
     def to_wire(self) -> dict[str, Any]:
         return {**self.observation.to_wire(), "metrics": dict(self.metrics)}
+
+
+@runtime_checkable
+class EnvironmentBackend(Protocol):
+    """Structural boundary implemented by simulator environment backends."""
+
+    def health(self) -> Mapping[str, Any]: ...
+
+    def reset(
+        self, run_id: str, episode_id: str, seed: int, max_steps: int
+    ) -> Observation: ...
+
+    def step(self, decision: DecisionPayload) -> StepResult: ...
+
+    def metrics(self) -> Mapping[str, Any]: ...
+
+    def shutdown(self) -> Mapping[str, Any]: ...
