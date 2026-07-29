@@ -1,0 +1,10 @@
+schema_version: luxinav.plugin.v1
+kind: adapter
+id: direct_control
+label: Direct Control
+provides: []
+requires: []
+accepts_decisions: [continuous_control]
+produces_decisions: []
+runtime:
+  service: decision-executor

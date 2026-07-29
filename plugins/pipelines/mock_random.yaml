@@ -1,0 +1,14 @@
+schema_version: luxinav.plugin.v1
+kind: pipeline
+id: mock_random
+label: Mock Random Explorer
+provides: []
+requires: []
+accepts_decisions: []
+produces_decisions: []
+runtime:
+  execution_profile: direct_agent
+  components:
+    environment: mock
+    agent: random_explorer
+    decision_executor: direct_control

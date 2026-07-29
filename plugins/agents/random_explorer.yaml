@@ -1,0 +1,10 @@
+schema_version: luxinav.plugin.v1
+kind: agent
+id: random_explorer
+label: Random Explorer
+provides: []
+requires: [pose]
+accepts_decisions: []
+produces_decisions: [continuous_control]
+runtime:
+  service: random-agent

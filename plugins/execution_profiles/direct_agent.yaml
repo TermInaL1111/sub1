@@ -1,0 +1,9 @@
+schema_version: luxinav.plugin.v1
+kind: execution_profile
+id: direct_agent
+label: Direct Agent
+provides: []
+requires: []
+accepts_decisions: []
+produces_decisions: []
+runtime: {}

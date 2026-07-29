@@ -1,0 +1,10 @@
+schema_version: luxinav.plugin.v1
+kind: simulator
+id: mock
+label: Deterministic Mock
+provides: [rgb, depth, pose, odometry, text_goal]
+requires: []
+accepts_decisions: [continuous_control, discrete_action, stop]
+produces_decisions: []
+runtime:
+  service: mock-worker
